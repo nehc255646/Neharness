@@ -35,10 +35,24 @@ if [ ! -f "$ROOT/.env" ]; then
   exit 1
 fi
 
-# Ctrl+C / 退出时回收子进程
+# Ctrl+C / 退出时回收子进程（只杀子进程，避免 kill 0 触发 trap 死循环）
+CLEANING=0
+BACKEND_PID=""
+FRONTEND_PID=""
 cleanup() {
+  if [ "$CLEANING" = 1 ]; then
+    return
+  fi
+  CLEANING=1
+  trap - EXIT INT TERM
   log "正在停止服务..."
-  kill 0 2>/dev/null || true
+  if [ -n "${BACKEND_PID}" ]; then
+    kill "$BACKEND_PID" 2>/dev/null || true
+  fi
+  if [ -n "${FRONTEND_PID}" ]; then
+    kill "$FRONTEND_PID" 2>/dev/null || true
+  fi
+  wait 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
@@ -46,9 +60,10 @@ trap cleanup EXIT INT TERM
 log "启动后端 (uvicorn --workers 1)..."
 (
   cd "$ROOT/backend"
-  [ -d .venv ] || uv sync
-  uv run alembic upgrade head
-  exec uv run uvicorn app.main:app --host "$BIND" --port "$BACKEND_PORT" --workers 1
+  uv sync
+  # python -m：不依赖 .venv/bin 脚本 shebang（仓库改名后旧解释器路径会失效）
+  uv run python -m alembic upgrade head
+  exec uv run python -m uvicorn app.main:app --host "$BIND" --port "$BACKEND_PORT" --workers 1
 ) >"$LOG_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 
