@@ -311,8 +311,8 @@ class SubAgentLoop:
                 mode=self.mode,
             )
             return
-        # 交互型只带主对话快照作背景；不注入假 user 消息，等侧栏真实输入再调模型
-        self.history = list(self.snapshot)
+        # 侧栏只记本对话；主对话快照仅作模型背景，刷新后从 DB 恢复 history
+        self.history = []
 
     def _effective_work_mode(self) -> str:
         if self.manager_get:
@@ -337,6 +337,8 @@ class SubAgentLoop:
         _slid, window = window_slice(self.history, settings.window_n)
         if self.kind == "interactive":
             system = INTERACTIVE_SYSTEM_PROMPT
+            _s, snap_win = window_slice(self.snapshot or [], settings.window_n)
+            window = snap_win + window
         elif self.mode == "explore":
             system = EXPLORE_WORKER_SYSTEM_PROMPT
         else:
@@ -362,6 +364,15 @@ class SubAgentLoop:
             logger.debug("persist interactive message failed", exc_info=True)
 
     async def run(self):
+        from app.core.workdir import bind_session, reset_session
+
+        token = bind_session(self.session_id)
+        try:
+            await self._run_bound()
+        finally:
+            reset_session(token)
+
+    async def _run_bound(self):
         logger.info("SubAgent run start: %s kind=%s session=%s", self.subagent_id, self.kind, self.session_id)
         try:
             from app.core import rtstore
@@ -404,7 +415,7 @@ class SubAgentLoop:
             except Exception as e:
                 logger.debug("Cleanup subagent shell group failed: %s", e)
 
-    def _drain_interactive_user(self) -> bool:
+    async def _drain_interactive_user(self) -> bool:
         got = False
         while not self.queue.empty():
             try:
@@ -414,12 +425,7 @@ class SubAgentLoop:
             if ev.get("type") == "user_message":
                 text = ev.get("content", "")
                 self.history.append({"role": "user", "content": text})
-                try:
-                    from app.core import rtstore
-
-                    rtstore.fire_and_forget(self._persist_interactive("user", text))
-                except Exception:
-                    logger.debug("queue persist interactive user failed", exc_info=True)
+                await self._persist_interactive("user", text)
                 got = True
         return got
 
@@ -429,7 +435,7 @@ class SubAgentLoop:
             rec = _subagents.get(self.subagent_id)
             if rec and rec.status != "running":
                 return False
-            if self._drain_interactive_user():
+            if await self._drain_interactive_user():
                 return True
             try:
                 if self._round == 0:
@@ -442,13 +448,8 @@ class SubAgentLoop:
             if ev.get("type") == "user_message":
                 text = ev.get("content", "")
                 self.history.append({"role": "user", "content": text})
-                try:
-                    from app.core import rtstore
-
-                    rtstore.fire_and_forget(self._persist_interactive("user", text))
-                except Exception:
-                    logger.debug("queue persist interactive user failed", exc_info=True)
-                self._drain_interactive_user()
+                await self._persist_interactive("user", text)
+                await self._drain_interactive_user()
                 return True
 
     async def _run_loop(self):
@@ -1230,6 +1231,126 @@ async def spawn_worker_batch(
     workers_payload = [collect_worker_report(sid) for sid in spawned]
     _batches.pop(batch_id, None)
     return format_batch_report(workers_payload)
+
+
+_INTERRUPT_RESULT = "[中断] 进程重启，工人未完成"
+
+
+async def hydrate_session_subagents(
+    session_id: str,
+    main_history: list[dict],
+    summary: str | None,
+    broadcaster,
+    main_enqueue,
+    manager_get,
+) -> None:
+    """进程重启后：交互型从 DB 恢复并继续等用户；未完成工人标中断。"""
+    try:
+        from app import persist as persist_mod
+    except Exception:
+        return
+    try:
+        runs = await persist_mod.list_subagent_runs(session_id)
+    except Exception:
+        logger.debug("hydrate list_subagent_runs failed", exc_info=True)
+        return
+    for run in runs:
+        if run.kind == "worker" and run.status == "running" and run.subagent_id not in _subagents:
+            try:
+                await persist_mod.upsert_subagent_run(
+                    main_session_id=session_id,
+                    subagent_id=run.subagent_id,
+                    kind="worker",
+                    status="error",
+                    result=_INTERRUPT_RESULT,
+                    late=False,
+                    finished=True,
+                )
+            except Exception:
+                logger.debug("interrupt worker on hydrate failed", exc_info=True)
+            rec = SubAgentRecord(
+                subagent_id=run.subagent_id,
+                session_id=session_id,
+                kind="worker",
+                status="error",
+                task=run.goal or "",
+                result=_INTERRUPT_RESULT,
+            )
+            rec.finished_at = time.time()
+            _subagents[run.subagent_id] = rec
+            _session_index.setdefault(session_id, set()).add(run.subagent_id)
+            continue
+        if run.kind != "interactive" or run.status != "running":
+            continue
+        if run.subagent_id in _subagents:
+            continue
+        history: list[dict] = []
+        try:
+            rows = await persist_mod.list_messages(session_id, agent_id=run.subagent_id)
+            for row in rows:
+                item = persist_mod.message_row_to_history(row)
+                if item.get("role") in ("user", "assistant") and str(item.get("content") or "").strip():
+                    history.append(
+                        {"role": item["role"], "content": item.get("content") or ""}
+                    )
+        except Exception:
+            logger.debug("hydrate interactive messages failed", exc_info=True)
+        await _restore_interactive(
+            session_id,
+            run.subagent_id,
+            run.behavior_desc or "用户侧栏对话",
+            run.goal or "",
+            main_history,
+            summary,
+            broadcaster,
+            main_enqueue,
+            manager_get,
+            history,
+        )
+
+
+async def _restore_interactive(
+    session_id: str,
+    subagent_id: str,
+    behavior_desc: str,
+    goal: str,
+    main_history: list[dict],
+    summary: str | None,
+    broadcaster,
+    main_enqueue,
+    manager_get,
+    history: list[dict],
+) -> None:
+    async with _spawn_lock(session_id):
+        if subagent_id in _subagents:
+            return
+        snapshot = _snapshot_history(main_history)
+        rec = SubAgentRecord(
+            subagent_id=subagent_id,
+            session_id=session_id,
+            kind="interactive",
+            status="running",
+            task=goal or behavior_desc or "交互任务",
+            behavior_desc=behavior_desc,
+        )
+        _subagents[subagent_id] = rec
+        _session_index.setdefault(session_id, set()).add(subagent_id)
+        loop = SubAgentLoop(
+            session_id,
+            subagent_id,
+            "interactive",
+            rec.task,
+            behavior_desc,
+            snapshot,
+            summary,
+            broadcaster,
+            main_enqueue,
+            manager_get=manager_get,
+        )
+        loop.history = list(history)
+        _loops[subagent_id] = loop
+        _tasks[subagent_id] = asyncio.create_task(loop.run())
+    logger.info("Restored interactive: %s session=%s messages=%d", subagent_id, session_id, len(history))
 
 
 async def handle_subagent_response(session_id: str, subagent_id: str, content: str) -> bool:

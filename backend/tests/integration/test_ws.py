@@ -126,6 +126,40 @@ def test_ws_user_opens_interactive():
         assert done.get("subagent_id") == sid
 
 
+def test_ws_interactive_survives_reconnect():
+    """侧栏对话进 hello：同进程重连仍能看到，且不含主对话快照。"""
+    session_id = f"it_{uuid.uuid4().hex[:8]}"
+    with TestClient(app) as client:
+        with client.websocket_connect(f"/ws?session_id={session_id}") as ws:
+            _recv_until(ws, "session.hello")
+            ws.send_json({"event": "subagent.open", "payload": {}})
+            opened = _recv_until(ws, "subagent.opened")
+            sid = str(opened.get("subagent_id", ""))
+            ws.send_json(
+                {
+                    "event": "subagent.response",
+                    "payload": {"subagent_id": sid, "content": "hello sidebar"},
+                }
+            )
+            while True:
+                msg = ws.receive()
+                text = msg.get("text")
+                if not text:
+                    continue
+                data = json.loads(text)
+                if data.get("event") == "message.done" and data.get("payload", {}).get("subagent_id") == sid:
+                    break
+        with client.websocket_connect(f"/ws?session_id={session_id}") as ws:
+            hello = _recv_until(ws, "session.hello")
+            panels = hello.get("subagent_panels") or []
+            hit = next((p for p in panels if p.get("subagent_id") == sid), None)
+            assert hit is not None
+            assert hit.get("status") == "running"
+            texts = [str(m.get("content") or "") for m in (hit.get("messages") or [])]
+            assert any("hello sidebar" in t for t in texts)
+            ws.send_json({"event": "agent.stop", "payload": {"agent_id": sid}})
+
+
 def test_ws_duplicate_approval_errors():
     session_id = f"it_{uuid.uuid4().hex[:8]}"
     with TestClient(app) as client, client.websocket_connect(f"/ws?session_id={session_id}") as ws:

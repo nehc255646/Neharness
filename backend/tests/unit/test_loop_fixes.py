@@ -290,6 +290,24 @@ def test_system_prompt_switches_with_work_mode():
     assert ag._bound_tools() == TOOLS
 
 
+def test_interactive_history_is_sidebar_only():
+    loop = sa.SubAgentLoop(
+        session_id="ut_side",
+        subagent_id="sub_side",
+        kind="interactive",
+        task="聊",
+        behavior_desc="",
+        snapshot=[{"role": "user", "content": "主任务"}],
+        summary=None,
+        broadcaster=None,
+        main_enqueue=None,
+    )
+    assert loop.history == []
+    assert sa._panel_messages_from_history(loop.history, "sub_side") == []
+    built = loop._build_messages()
+    assert any("主任务" in str(m.get("content")) for m in built)
+
+
 def test_subagent_system_prompts_are_distinct_english():
     assert "BACKGROUND WORKER" in WORKER_SYSTEM_PROMPT
     assert "INTERACTIVE SIDEBAR" in INTERACTIVE_SYSTEM_PROMPT

@@ -5,11 +5,13 @@ import uuid
 
 import pytest
 
+from app.agent import subagent as sa
 from app.agent.loop import AgentLoop
 from app.core.config import settings
 from app.core.db import init_db
 from app.persist import (
     ensure_session,
+    list_subagent_runs,
     load_late_subagent_results,
     save_message,
     save_summary,
@@ -148,3 +150,67 @@ async def test_hydrate_feeds_back_late_subagent_results():
     await agent2.hydrate_from_db()
     fed2 = [m for m in agent2.history if m["role"] == "user" and str(m["content"]).startswith("[迟到子 agent 结果")]
     assert len(fed2) == 1
+
+
+async def test_hydrate_restores_running_interactive():
+    ok = await init_db()
+    if not ok:
+        pytest.skip("MySQL unavailable")
+    sid = f"ut_{uuid.uuid4().hex[:12]}"
+    await ensure_session(sid, title="restore-interactive")
+    await save_message(session_id=sid, agent_id="main", role="user", content="主对话不该出现在侧栏")
+    sub_id = f"sub_{uuid.uuid4().hex[:8]}"
+    await upsert_subagent_run(
+        main_session_id=sid,
+        subagent_id=sub_id,
+        kind="interactive",
+        behavior_desc="用户侧栏对话",
+        goal="侧栏",
+        status="running",
+    )
+    await save_message(session_id=sid, agent_id=sub_id, role="user", content="侧栏你好")
+    await save_message(session_id=sid, agent_id=sub_id, role="assistant", content="收到侧栏")
+    agent = AgentLoop(sid)
+    try:
+        await agent.hydrate_from_db()
+        rec = sa.get_subagent(sub_id)
+        assert rec is not None and rec.status == "running"
+        loop = sa._loops.get(sub_id)
+        assert loop is not None
+        assert [m.get("content") for m in loop.history] == ["侧栏你好", "收到侧栏"]
+        assert all("主对话不该出现" not in str(m.get("content")) for m in loop.history)
+        built = loop._build_messages()
+        assert any("主对话不该出现" in str(m.get("content")) for m in built)
+        assert any("侧栏你好" in str(m.get("content")) for m in built)
+    finally:
+        await sa.stop_session_subagents(sid)
+        sa.purge_session(sid)
+        await agent.stop()
+
+
+async def test_hydrate_interrupts_stale_workers():
+    ok = await init_db()
+    if not ok:
+        pytest.skip("MySQL unavailable")
+    sid = f"ut_{uuid.uuid4().hex[:12]}"
+    await ensure_session(sid, title="interrupt-worker")
+    wk_id = f"wk_{uuid.uuid4().hex[:8]}"
+    await upsert_subagent_run(
+        main_session_id=sid,
+        subagent_id=wk_id,
+        kind="worker",
+        goal="切片任务",
+        status="running",
+    )
+    agent = AgentLoop(sid)
+    try:
+        await agent.hydrate_from_db()
+        runs = await list_subagent_runs(sid, kind="worker")
+        assert len(runs) == 1
+        assert runs[0].status == "error"
+        assert "进程重启" in (runs[0].result or "")
+        rec = sa.get_subagent(wk_id)
+        assert rec is not None and rec.status == "error"
+    finally:
+        sa.purge_session(sid)
+        await agent.stop()

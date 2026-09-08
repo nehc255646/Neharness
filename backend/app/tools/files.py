@@ -7,7 +7,7 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
-from app.core.config import settings
+from app.core.workdir import current_workdir
 
 logger = logging.getLogger("neharness.files")
 
@@ -64,12 +64,7 @@ def apply_edit(path: str, old_string: str, new_string: str) -> tuple[str, dict |
 
 
 def _workdir() -> Path:
-    p = Path(settings.workdir)
-    if not p.is_absolute():
-        # backend/app/tools -> backend -> project root
-        p = (Path(__file__).resolve().parents[3] / settings.workdir).resolve()
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return current_workdir()
 
 
 def _contained(path: Path, wd: Path) -> bool:

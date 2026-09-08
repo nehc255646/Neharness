@@ -177,6 +177,20 @@ class AgentLoop:
                 gate.replace_session_rules(self.session_id, rules, persist=False)
         except Exception:
             logger.debug("hydrate allow_rules failed", exc_info=True)
+        try:
+            from app.agent.manager import manager
+            from app.agent.subagent import hydrate_session_subagents
+
+            await hydrate_session_subagents(
+                self.session_id,
+                self.history,
+                self.summary,
+                self.broadcaster,
+                self.enqueue,
+                manager.get,
+            )
+        except Exception:
+            logger.debug("hydrate subagents failed", exc_info=True)
 
     def _ensure_running(self):
         if self._task is None or self._task.done():
@@ -252,6 +266,15 @@ class AgentLoop:
     # ---------- 主循环 ----------
 
     async def run(self):
+        from app.core.workdir import bind_session, reset_session
+
+        token = bind_session(self.session_id)
+        try:
+            await self._run_body()
+        finally:
+            reset_session(token)
+
+    async def _run_body(self):
         logger.info("AgentLoop run started: session=%s", self.session_id)
         # 队列空则 idle：hydrate 重建的历史不是进行中的一轮，须等新的用户/回投事件
         await self._set_state("idle" if self.queue.empty() else "running")

@@ -2,37 +2,74 @@
 
 [中文](README.md) · English
 
-Neharness is a personal, single-machine, single-user web coding agent. The main chat streams work; you open an **interactive** sub-agent from the header; the main agent can spawn **worker** sub-agents in the background. Writes and shell commands go through approval by default.
+[![CI](https://github.com/nehc255646/Neharness/actions/workflows/ci.yml/badge.svg)](https://github.com/nehc255646/Neharness/actions/workflows/ci.yml)
+[![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+A personal, single-machine, single-user web coding agent.
+
+A hand-written asyncio loop streams thinking, text, and tool calls on three channels. Writes and shell commands go through an approval gate by default. The main agent can spawn background workers; you open an interactive sidebar sub-agent from the header. This is not a LangChain AgentExecutor wrapper, and it is not a multi-tenant product.
 
 No auth, no rate limits. Binds to localhost by default. Do not expose this to the public internet.
 
 ---
 
-## What it does
-
-| | |
-|---|---|
-| Chat | Streaming text and thinking, tool cards, line-level diffs for write/edit |
-| Modes | Composer **Auto** (can edit files and run commands) / **Plan** (read-only research + a plan) |
-| Gate | Blacklist · `allow_rules.yaml` · session “allow similar” · first-time three-way prompt |
-| Sub-agents | Interactive (sidebar; summary posted back) · workers (background, batched results) |
-| Sessions | List, resume, rename; history lives in MySQL across restarts |
-| Models | OpenAI-compatible provider groups; api keys Fernet-encrypted; optional `*_API_KEY` env |
-
-“Similar” (session allow): shell uses the first two tokens of the command; other tools use the tool name. Chained commands count as similar if they start with that prefix — that is intentional.
-
 ## Stack
 
-Backend: Python 3.14 · FastAPI · hand-written asyncio loop · LangChain. Source of truth: MySQL 8 (Alembic). Redis mirrors agent state, in-flight approvals, session allow rules, and summary cache (falls back to memory if Redis is down). Frontend: React 18 · TypeScript · Vite · Tailwind · zustand · WebSocket.
+| Layer | Choice | Role |
+|---|---|---|
+| Agent runtime | Python 3.14 · hand-written asyncio loop · LangChain tool binding · OpenAI-compatible streaming | One `AgentLoop` per session: drain queue → sliding window / summary → model → **sequential** tool dispatch → atomic history fill |
+| API | FastAPI · WebSocket + REST · uvicorn `--workers 1` | Chat, approvals, stop, and sub-agents over WS; providers / models / sessions over REST |
+| Source of truth | MySQL 8 · SQLAlchemy asyncio · Alembic | Sessions, messages, tool logs, sub-agent runs, encrypted provider keys |
+| Realtime mirror | Redis (in-memory fallback) | Agent state, in-flight approvals, session allow rules, summary cache. TTL expiry ≠ end of life |
+| Frontend | React 18 · TypeScript · Vite · Tailwind · zustand | Timeline, tool cards, line-level diffs, three-way approval, sidebar, worker list |
+| Safety | Fernet · per-session workspace · blacklist / allow rules | `api_key` encrypted at rest; files and shell locked to `WORKDIR/<session_id>/` |
+| Engineering | uv · ruff · pytest · GitHub Actions | Backend unit + WS integration tests; frontend `tsc` + eslint |
 
-The backend **must be a single process** (`uvicorn --workers 1`). `AgentManager` is in-process; extra workers break approval routing.
+The backend **must be a single process**. `AgentManager` and approval futures are in-process; extra workers break routing.
 
-## Requirements
+---
 
-- Python 3.14 + [uv](https://docs.astral.sh/uv/)
-- Node.js 18+
-- MySQL 8 (`localhost:3306`; or root `docker-compose.yml`)
-- Redis (needed for reconnect / session-allow mirroring)
+## Features
+
+**A loop you can explain, not a framework you hide behind.** Streaming thinking (`reasoning_content` / `<think>`) is split from text and tool calls. Tools run in order so “allow similar this session” can apply to later shell calls in the same turn. Composer **Auto** can edit files and run commands; **Plan** binds read-only tools and produces a plan.
+
+**The gate is a policy, not a modal.** Blacklist (segmented, including `rm -rf` variants) → `allow_rules.yaml` → session “allow similar” → otherwise a three-way prompt (once / similar / reject). Config allow requires **every** chained segment to match a prefix. Session-similar matches the **start of the whole command** (first two tokens when the rule is stored). Those two matchers are intentionally different.
+
+**Two sub-agent kinds, deliberately asymmetric.** Interactive agents are user-opened only: no file or shell tools; a summary posts back to the main thread. Workers are spawned by the main agent: it must have used read/glob/grep first; each task must be a true subset of the user goal with a concrete `done_when`; wholesale subcontracting and fake splits are rejected. `spawn_*` blocks until the batch finishes and returns JSON as the tool result. Workers that finish after the main agent is `done` are marked `late` and fed back on the next hydrate.
+
+**Storage layers you can defend in an interview.** MySQL is authoritative; Redis only mirrors realtime state. After a process restart: missing tool rows are synthesized, still-running interactive agents are restored, unfinished workers are marked interrupted. In-flight approval futures are not resumed — that recovery boundary is documented, not pretended away.
+
+**Per-session workspace.** Each session gets a subdirectory; outbound symlinks and `../` do not escape. The shell subprocess does not inherit `ENCRYPTION_KEY`, `MYSQL_*`, or `*_API_KEY`.
+
+**The UI is a control plane.** Streaming timeline, collapsed thinking, line-level diffs for write/edit, approval modal, session list, OpenAI-compatible providers (probe per model; optional `*_API_KEY` env).
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  UI[React UI] -->|WebSocket + REST| API[FastAPI single process]
+  API --> Loop[Hand-written AgentLoop]
+  Loop --> Gate[Approval gate]
+  Loop --> Tools[Files / shell / workers]
+  Loop --> MySQL[(MySQL source of truth)]
+  Loop --> Redis[(Redis mirror)]
+```
+
+If this ever scales out, pin `session_id` to a process. Do not promote Redis to source of truth.
+
+---
+
+## Design choices
+
+- **Config allow vs session-similar:** see the gate above. `ls; rm -rf /` must not pass because `ls` is allowlisted; `echo hello && echo world` should pass after the user clicked “allow similar”.
+- **Workers are not the main agent.** Their brief is “your only task”, not a copy of the main transcript. Overlapping files, restating the user’s request, or spawning before exploring are rejected.
+- **Interactive agents are user-opened.** `spawn_subagent` from the main agent is refused. Closing the panel does not stop the agent.
+- **Single process is a hard constraint.** Approvals hang on in-process futures. That is the current correct boundary, not a missing cluster.
+
+---
 
 ## Quick start
 
@@ -40,18 +77,13 @@ The backend **must be a single process** (`uvicorn --workers 1`). `AgentManager`
 cp .env.example .env
 ```
 
-Fill in at least:
-
-| Variable | Purpose |
-|---|---|
-| `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` | Prefer user/database `harness`; do not run day-to-day as root |
-| `ENCRYPTION_KEY` | Fernet key for provider api keys. Boot refuses if providers exist and the key is missing |
+Fill in `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE` (prefer `harness`, not root) and `ENCRYPTION_KEY`:
 
 ```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-Create the database once:
+Boot refuses if providers exist and the key is missing. Create the database once:
 
 ```sql
 CREATE DATABASE harness CHARACTER SET utf8mb4;
@@ -63,66 +95,53 @@ FLUSH PRIVILEGES;
 No local MySQL / Redis:
 
 ```bash
-docker compose up -d
+docker compose up -d   # 3306 / 6379 on 127.0.0.1 only
+./start.sh             # backend :8000 one worker + frontend :5173
 ```
 
-Compose publishes 3306 / 6379 on `127.0.0.1` only. Then:
-
-```bash
-chmod +x start.sh
-./start.sh
-```
-
-Starts the backend on `:8000` (one worker) and the frontend on `:5173`, and tries to open a browser. Both bind to `127.0.0.1` by default.
-
-From a host browser into a VM:
-
-```bash
-NEHARNESS_BIND=0.0.0.0 ./start.sh
-```
-
-No auth — trusted LAN only. Add the host origin to `CORS_ORIGINS`.
+From a host browser into a VM: `NEHARNESS_BIND=0.0.0.0 ./start.sh`, and add the origin to `CORS_ORIGINS`. Trusted LAN only.
 
 Manual start:
 
 ```bash
-cd backend
-uv sync
-uv run alembic upgrade head
+cd backend && uv sync && uv run alembic upgrade head
 uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 
-# another terminal
-cd frontend
-npm install
-npm run dev
+cd frontend && npm install && npm run dev
 ```
 
 Vite proxies `/api` and `/ws` to `:8000`. Open [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
+With no models configured, heuristic demo mode is used — try `执行 echo hello` / `run echo hello` to hit approval.
+
+---
+
 ## Usage
 
-1. Open **Models**, add an OpenAI-compatible `base_url` + `api_key` (or a `*_API_KEY` env var), then test each model (failure does not block save).
-2. In the composer, switch Auto / Plan, pick a provider, then a model. Model changes apply on the next send. With no models, heuristic demo mode is used — try `执行 echo hello` / `run echo hello` to hit approval.
-3. Non-allowlisted `shell` / `write` / `edit` prompts: **once** / **allow similar this session** / **reject**.
-4. **Sub Agent** in the header opens the interactive sidebar (closing the panel does not stop it; the panel has a stop control). The main agent can spawn workers (bottom workspace). Header **Stop** stops the main agent and its children.
-5. Files and shell are locked to `WORKDIR` (default `workspace/` in the repo). Persistent allow rules: `allow_rules.yaml`.
+1. Open **Models**, add an OpenAI-compatible `base_url` + `api_key` (or a `*_API_KEY` env var), then probe each model (failure does not block save).
+2. Switch Auto / Plan in the composer; pick provider, then model. Changes apply on the next send.
+3. Non-allowlisted `shell` / `write` / `edit`: **once** / **allow similar this session** / **reject**.
+4. Open an interactive sidebar from the header; the main agent can spawn workers. Header **Stop** stops the main agent and its children.
+5. Files and shell live in `WORKDIR/<session_id>/`. Persistent allow rules: `allow_rules.yaml`.
+
+---
 
 ## Safety model
 
 This is not a sandbox. The gate is for you, not an adversary.
 
-- The blacklist splits on `;` `&&` `||` `|` plus a few destructive patterns such as `rm -rf`. It is not a semantic command analyzer.
-- Config allow requires **every** segment to match a prefix. Session “similar” matches the **start of the whole command** (on purpose, or “allow similar” is useless).
-- `read` / `write` / `edit` stay inside `WORKDIR` and do not follow outbound symlinks; `grep` does the same.
-- The shell subprocess does not inherit `ENCRYPTION_KEY`, `MYSQL_*`, `*_API_KEY`, and similar secrets.
+- The blacklist splits on `;` `&&` `||` `|` plus destructive patterns such as `rm -rf`. It is not a semantic command analyzer.
+- `read` / `write` / `edit` / `grep` do not follow symlinks out of the session workspace.
 - `/api/llm/probe` only allows `http(s)`; env var names must end in `_API_KEY`.
+
+---
 
 ## Configuration (excerpt)
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WORKDIR` | `./workspace` | Root for files and shell |
-| `HOST` | `127.0.0.1` | Backend bind; use `0.0.0.0` plus `CORS_ORIGINS` for LAN |
+| `WORKDIR` | `./workspace` | Workspace root; each session uses a subdirectory |
+| `HOST` | `127.0.0.1` | Backend bind |
 | `CORS_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173` | Browser Origin allowlist |
 | `LLM_TIMEOUT` | `180` | Model request timeout (seconds) |
 | `MAX_ROUNDS` | `50` | Max loop rounds per run |
@@ -137,6 +156,8 @@ This is not a sandbox. The gate is for you, not an adversary.
 
 See `.env.example` for the full list.
 
+---
+
 ## Development
 
 ```bash
@@ -144,17 +165,20 @@ cd backend && uv run ruff check app tests && uv run pytest
 cd frontend && npx tsc --noEmit && npm run lint
 ```
 
-API docs: `http://127.0.0.1:8000/docs`. Health: `GET /health`, `GET /api/health`.
+CI: `.github/workflows/ci.yml`. API docs: `http://127.0.0.1:8000/docs`. Health: `GET /health`, `GET /api/health`.
 
 Integration tests write `it_` / `ut_` sessions and `example.invalid` providers into MySQL; delete them when you are done.
 
+---
+
 ## Known limits
 
-- A process crash drops in-flight loops and approval futures; recovery is **history already in MySQL**
-- Sessions share one `workspace` and may edit the same files
-- Redis TTL expiry is not end-of-life; without Redis, reconnect is in-memory only
-- Interactive sidebar transcripts live mostly in memory; a full reload may empty the panel even though the summary still posts back
+- A process crash drops in-flight approval futures; mid-tool resume is out of scope
+- Without Redis, reconnect is in-memory only
+- No auth; do not expose this to the public internet
+
+---
 
 ## License
 
-Personal project; no OSI license is declared. All rights reserved unless you add one.
+[MIT](LICENSE)

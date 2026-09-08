@@ -14,16 +14,13 @@ from pathlib import Path
 from langchain_core.tools import tool
 
 from app.core.config import settings
+from app.core.workdir import current_workdir
 
 logger = logging.getLogger("neharness.shell")
 
 
 def _workdir() -> Path:
-    p = Path(settings.workdir)
-    if not p.is_absolute():
-        p = (Path(__file__).resolve().parents[3] / settings.workdir).resolve()
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+    return current_workdir()
 
 
 # 跟踪 shell 进程组，按 agent 分组，供 agent.stop 定向回收
