@@ -1,7 +1,7 @@
 [project]
 name = "neharness-backend"
 version = "0.1.0"
-description = "Neharness backend — FastAPI + LangChain hand-written loop"
+description = "个人单机、单用户的 Web coding agent 后端"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
